@@ -1,179 +1,131 @@
 import streamlit as st
-import requests
-import socket
 import pandas as pd
+import socket
 import ipaddress
-import concurrent.futures
+import requests
+import asyncio
+import aiohttp
+import ssl
+from functools import lru_cache
 
-st.title("AWS Usage Checker Pro")
+st.set_page_config(page_title="AWS Usage Checker", layout="wide")
+st.title("AWS Usage Checker – Advanced")
 
-MAX_WORKERS = 25
-TIMEOUT = 4
-RETRIES = 2
-
-session = requests.Session()
-session.headers.update({"User-Agent": "Mozilla/5.0"})
-
-# ---------- AWS IP RANGES ----------
-
+# --------------------
+# Load AWS IP ranges
+# --------------------
 @st.cache_data(ttl=3600)
 def load_aws_ips():
-    r = requests.get("https://ip-ranges.amazonaws.com/ip-ranges.json", timeout=10)
+    url = "https://ip-ranges.amazonaws.com/ip-ranges.json"
+    r = requests.get(url, timeout=10)
     data = r.json()
-    return [
-        ipaddress.ip_network(p["ip_prefix"])
-        for p in data["prefixes"]
-        if "ip_prefix" in p
-    ]
+    return [ipaddress.ip_network(prefix["ip_prefix"]) for prefix in data["prefixes"] if "ip_prefix" in prefix]
 
 aws_networks = load_aws_ips()
 
-# ---------- SIGNAL LIBRARY ----------
+# --------------------
+# AWS hints
+# --------------------
+AWS_HINTS_HTML = ["amazonaws.com", "cloudfront.net", "awsstatic"]
+AWS_HINTS_HEADERS = ["x-amz-", "server: amazonS3", "x-amz-cf-id", "via: cloudfront"]
 
-AWS_HTML = ["amazonaws", "awsstatic"]
-AWS_HEADERS = ["x-amz", "amazons3", "awselb"]
-
-SERVICE_PATTERNS = {
-    "cloudfront": ["cloudfront"],
-    "s3": ["s3.amazonaws", "amazons3"],
-    "elb": ["awselb", "elasticloadbalancing"],
-    "apigw": ["execute-api"]
-}
-
-# ---------- HELPERS ----------
-
-def fetch_with_retry(url):
-    for _ in range(RETRIES):
-        try:
-            return session.get(url, timeout=TIMEOUT, allow_redirects=True)
-        except:
-            continue
-    return None
-
-
-def aws_label(score):
-    if score >= 80:
-        return "AWS Confirmed"
-    if score >= 50:
-        return "AWS Likely"
-    if score >= 25:
-        return "AWS Possible"
-    return "No AWS Signals"
-
-
-# ---------- DOMAIN CHECK ----------
-
-def check_domain(domain):
-    domain = str(domain).strip()
-
-    score = 0
-    ip_found = ""
-    sig_ip = False
-    sig_header = False
-    sig_html = False
-
-    service_flags = {
-        "cloudfront": False,
-        "s3": False,
-        "elb": False,
-        "apigw": False
-    }
-
+# --------------------
+# Helper functions
+# --------------------
+@lru_cache(maxsize=None)
+def resolve_ip(domain):
     try:
-        ip = socket.gethostbyname(domain)
-        ip_found = ip
-        ip_obj = ipaddress.ip_address(ip)
+        return socket.gethostbyname(domain)
+    except Exception:
+        return None
 
-        for net in aws_networks:
-            if ip_obj in net:
-                sig_ip = True
-                score += 70
-                break
+async def fetch(session, url):
+    try:
+        async with session.get(url, timeout=6, ssl=False) as response:
+            html = await response.text()
+            headers = {k.lower(): v.lower() for k, v in response.headers.items()}
+            return html.lower(), headers
+    except:
+        return "", {}
 
-        r = fetch_with_retry(f"https://{domain}") or fetch_with_retry(f"http://{domain}")
+def check_ip_aws(ip):
+    if not ip:
+        return False
+    ip_obj = ipaddress.ip_address(ip)
+    for net in aws_networks:
+        if ip_obj in net:
+            return True
+    return False
 
-        if r:
-            headers = str(r.headers).lower()
-            html = r.text.lower()
-            blob = headers + " " + html
+def confidence_score(ip_match, html_match, header_match):
+    score = 0
+    if ip_match: score += 50
+    if html_match: score += 25
+    if header_match: score += 25
+    return min(score, 100)
 
-            if any(h in headers for h in AWS_HEADERS):
-                sig_header = True
-                score += 20
+async def check_domain_async(session, domain):
+    domain = domain.strip()
+    result = {"domain": domain, "aws_signal": False, "reason": "", "confidence": 0, "services": []}
 
-            if any(h in html for h in AWS_HTML):
-                sig_html = True
-                score += 15
+    ip = resolve_ip(domain)
+    ip_match = check_ip_aws(ip)
+    reason_list = []
+    if ip_match:
+        reason_list.append(f"AWS IP ({ip})")
+        result["services"].append("AWS-hosted")
 
-            # service detection
-            for svc, patterns in SERVICE_PATTERNS.items():
-                if any(p in blob for p in patterns):
-                    service_flags[svc] = True
-                    score += 5
+    url = f"http://{domain}"
+    html, headers = await fetch(session, url)
 
-    except Exception as e:
-        return {
-            "domain": domain,
-            "ip": ip_found,
-            "confidence": 0,
-            "classification": "Error",
-            "aws_ip_signal": False,
-            "header_signal": False,
-            "html_signal": False,
-            "aws_service_cloudfront": False,
-            "aws_service_s3": False,
-            "aws_service_elb": False,
-            "aws_service_apigw": False,
-            "service_hits": "",
-            "error": str(e)
-        }
+    html_match = any(hint in html for hint in AWS_HINTS_HTML)
+    header_match = any(hint in str(headers) for hint in AWS_HINTS_HEADERS)
 
-    score = min(score, 100)
+    if html_match: reason_list.append("HTML hints")
+    if header_match: reason_list.append("Header hints")
 
-    services = [k for k, v in service_flags.items() if v]
+    result["aws_signal"] = ip_match or html_match or header_match
+    result["reason"] = " | ".join(reason_list)
+    result["confidence"] = confidence_score(ip_match, html_match, header_match)
 
-    return {
-        "domain": domain,
-        "ip": ip_found,
-        "confidence": score,
-        "classification": aws_label(score),
-        "aws_ip_signal": sig_ip,
-        "header_signal": sig_header,
-        "html_signal": sig_html,
-        "aws_service_cloudfront": service_flags["cloudfront"],
-        "aws_service_s3": service_flags["s3"],
-        "aws_service_elb": service_flags["elb"],
-        "aws_service_apigw": service_flags["apigw"],
-        "service_hits": ",".join(services),
-        "error": ""
-    }
+    # Identify services
+    if "cloudfront.net" in html or "x-amz-cf-id" in headers:
+        result["services"].append("CloudFront")
+    if "amazonaws.com" in html or "x-amz-" in headers:
+        result["services"].append("S3")
+    if "elb.amazonaws.com" in html:
+        result["services"].append("ELB")
+    if "execute-api" in html:
+        result["services"].append("API Gateway")
 
+    return result
 
-# ---------- UI ----------
-
+# --------------------
+# Upload CSV
+# --------------------
 file = st.file_uploader("Upload domain CSV", type=["csv"])
-
 if file:
     df = pd.read_csv(file, header=None, names=["domain"])
-    domains = df["domain"].dropna().tolist()
-
     results = []
-    bar = st.progress(0)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = [ex.submit(check_domain, d) for d in domains]
+    progress_bar = st.progress(0)
+    total = len(df)
 
-        for i, f in enumerate(concurrent.futures.as_completed(futures), 1):
-            results.append(f.result())
-            bar.progress(i / len(domains))
+    async def process_all(domains):
+        async with aiohttp.ClientSession() as session:
+            tasks = [check_domain_async(session, d) for d in domains]
+            for i, task in enumerate(asyncio.as_completed(tasks)):
+                res = await task
+                results.append(res)
+                progress_bar.progress((i + 1) / total)
+    
+    asyncio.run(process_all(df["domain"]))
 
     out = pd.DataFrame(results)
-
-    st.success(f"Checked {len(out)} domains")
     st.dataframe(out)
 
     st.download_button(
-        "Download AWS Results CSV",
+        "Download Results",
         out.to_csv(index=False),
         "aws_results.csv"
     )

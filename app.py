@@ -5,11 +5,12 @@ import socket
 import pandas as pd
 import ipaddress
 import requests
+import dns.resolver
 
 st.set_page_config(page_title="AWS Usage Checker (Async)", layout="wide")
 st.title("AWS Usage Checker (Async)")
 
-# Load AWS IP ranges (cached for 1 hour)
+# Load AWS IP ranges (cached 1 hour)
 @st.cache_data(ttl=3600)
 def load_aws_ips():
     url = "https://ip-ranges.amazonaws.com/ip-ranges.json"
@@ -20,9 +21,10 @@ def load_aws_ips():
 
 aws_networks = load_aws_ips()
 
-# AWS hints in HTML and headers
+# AWS hints
 AWS_HINTS_HTML = ["amazonaws.com", "cloudfront.net", "awsstatic"]
 AWS_HINTS_HEADERS = ["x-amz-", "server: AmazonS3"]
+COMMON_SUBDOMAINS = ["www", "cdn", "static", "media"]
 
 # Async domain checker
 async def check_domain_async(session, domain):
@@ -36,56 +38,62 @@ async def check_domain_async(session, domain):
         "details": []
     }
 
-    try:
-        # IP check
-        ip = socket.gethostbyname(domain)
-        ip_obj = ipaddress.ip_address(ip)
-        ip_hit = False
-        for net in aws_networks:
-            if ip_obj in net:
-                result["confidence"] = 100
-                ip_hit = True
-                result["details"].append(f"IP {ip} in AWS range")
-                break
-        if not ip_hit:
-            result["details"].append(f"IP {ip} not in AWS range")
+    tried_domains = [domain] + [f"{sub}.{domain}" for sub in COMMON_SUBDOMAINS]
 
-        # HTTP request
+    for d in tried_domains:
         try:
-            async with session.get(f"http://{domain}", timeout=6) as resp:
-                html = await resp.text()
-                html = html.lower()
-                headers_lower = {k.lower(): v.lower() for k, v in resp.headers.items()}
+            # IP check
+            ip = socket.gethostbyname(d)
+            ip_obj = ipaddress.ip_address(ip)
+            ip_hit = False
+            for net in aws_networks:
+                if ip_obj in net:
+                    result["confidence"] = 100
+                    ip_hit = True
+                    result["details"].append(f"{d} IP {ip} in AWS range")
+                    break
+            if not ip_hit:
+                result["details"].append(f"{d} IP {ip} not in AWS range")
 
-                # HTML hints
-                html_hits = [hint for hint in AWS_HINTS_HTML if hint in html]
-                if html_hits:
-                    result["confidence"] = max(result["confidence"], 80)
-                    result["details"].append(f"HTML hints found: {', '.join(html_hits)}")
-                else:
-                    result["details"].append("No HTML hints")
-
-                # Header hints
-                header_hits = [hint for hint in AWS_HINTS_HEADERS if hint in str(headers_lower)]
-                if header_hits:
+            # DNS CNAME check
+            try:
+                answers = dns.resolver.resolve(d, 'CNAME')
+                cname_hits = [ans.to_text() for ans in answers if any(hint in ans.to_text() for hint in AWS_HINTS_HTML)]
+                if cname_hits:
                     result["confidence"] = max(result["confidence"], 90)
-                    result["details"].append(f"Header hints found: {', '.join(header_hits)}")
-                else:
-                    result["details"].append("No header hints")
+                    result["details"].append(f"{d} CNAME hints: {', '.join(cname_hits)}")
+            except Exception:
+                result["details"].append(f"{d} no CNAME / CloudFront hints")
+
+            # HTTP request
+            try:
+                async with session.get(f"http://{d}", timeout=6) as resp:
+                    html = await resp.text()
+                    html = html.lower()
+                    headers_lower = {k.lower(): v.lower() for k, v in resp.headers.items()}
+
+                    # HTML hints
+                    html_hits = [hint for hint in AWS_HINTS_HTML if hint in html]
+                    if html_hits:
+                        result["confidence"] = max(result["confidence"], 80)
+                        result["details"].append(f"{d} HTML hints found: {', '.join(html_hits)}")
+
+                    # Header hints
+                    header_hits = [hint for hint in AWS_HINTS_HEADERS if hint in str(headers_lower)]
+                    if header_hits:
+                        result["confidence"] = max(result["confidence"], 90)
+                        result["details"].append(f"{d} Header hints found: {', '.join(header_hits)}")
+
+            except Exception as e:
+                result["details"].append(f"{d} HTTP error: {str(e)}")
 
         except Exception as e:
-            result["details"].append(f"HTTP error: {str(e)}")
+            result["details"].append(f"{d} DNS/IP error: {str(e)}")
 
-        # Determine if on AWS
-        result["on_aws"] = result["confidence"] >= 100
-        result["aws_signal"] = result["confidence"] > 0
-        result["reason"] = " | ".join(result["details"])
-
-    except Exception as e:
-        result["reason"] = f"DNS error: {str(e)}"
-        result["confidence"] = 0
-        result["on_aws"] = False
-        result["aws_signal"] = False
+    # Final determination
+    result["on_aws"] = result["confidence"] >= 100
+    result["aws_signal"] = result["confidence"] > 0
+    result["reason"] = " | ".join(result["details"])
 
     return result
 
@@ -93,9 +101,7 @@ async def check_domain_async(session, domain):
 file = st.file_uploader("Upload domain CSV", type=["csv"])
 if file:
     df = pd.read_csv(file, header=None, names=["domain"])
-    results = []
-
-    st.info(f"Checking {len(df)} domains asynchronously...")
+    st.info(f"Checking {len(df)} domains asynchronously (including common subdomains)...")
 
     async def run_checks():
         async with aiohttp.ClientSession() as session:

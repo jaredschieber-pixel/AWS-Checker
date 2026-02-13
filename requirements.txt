@@ -1,4 +1,6 @@
 streamlit
 pandas
 aiohttp
+requests
+
 

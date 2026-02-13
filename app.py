@@ -3,75 +3,178 @@ import requests
 import socket
 import pandas as pd
 import ipaddress
-import json
+import concurrent.futures
 
-st.title("AWS Usage Checker (Advanced)")
+st.title("AWS Usage Checker Pro")
 
-# Load AWS IP ranges
+MAX_WORKERS = 25
+TIMEOUT = 4
+RETRIES = 2
+
+session = requests.Session()
+session.headers.update({"User-Agent": "Mozilla/5.0"})
+
+# ---------- AWS IP RANGES ----------
+
 @st.cache_data(ttl=3600)
 def load_aws_ips():
-    url = "https://ip-ranges.amazonaws.com/ip-ranges.json"
-    r = requests.get(url, timeout=10)
+    r = requests.get("https://ip-ranges.amazonaws.com/ip-ranges.json", timeout=10)
     data = r.json()
-    aws_networks = [ipaddress.ip_network(prefix["ip_prefix"]) for prefix in data["prefixes"] if "ip_prefix" in prefix]
-    return aws_networks
+    return [
+        ipaddress.ip_network(p["ip_prefix"])
+        for p in data["prefixes"]
+        if "ip_prefix" in p
+    ]
 
 aws_networks = load_aws_ips()
 
-# AWS hints in HTML and headers
-AWS_HINTS_HTML = ["amazonaws.com", "cloudfront.net", "awsstatic"]
-AWS_HINTS_HEADERS = ["x-amz-", "server: AmazonS3"]
+# ---------- SIGNAL LIBRARY ----------
+
+AWS_HTML = ["amazonaws", "awsstatic"]
+AWS_HEADERS = ["x-amz", "amazons3", "awselb"]
+
+SERVICE_PATTERNS = {
+    "cloudfront": ["cloudfront"],
+    "s3": ["s3.amazonaws", "amazons3"],
+    "elb": ["awselb", "elasticloadbalancing"],
+    "apigw": ["execute-api"]
+}
+
+# ---------- HELPERS ----------
+
+def fetch_with_retry(url):
+    for _ in range(RETRIES):
+        try:
+            return session.get(url, timeout=TIMEOUT, allow_redirects=True)
+        except:
+            continue
+    return None
+
+
+def aws_label(score):
+    if score >= 80:
+        return "AWS Confirmed"
+    if score >= 50:
+        return "AWS Likely"
+    if score >= 25:
+        return "AWS Possible"
+    return "No AWS Signals"
+
+
+# ---------- DOMAIN CHECK ----------
 
 def check_domain(domain):
-    domain = domain.strip()
-    result = {"domain": domain, "aws_signal": False, "reason": ""}
+    domain = str(domain).strip()
+
+    score = 0
+    ip_found = ""
+    sig_ip = False
+    sig_header = False
+    sig_html = False
+
+    service_flags = {
+        "cloudfront": False,
+        "s3": False,
+        "elb": False,
+        "apigw": False
+    }
 
     try:
-        # Get IP
         ip = socket.gethostbyname(domain)
+        ip_found = ip
         ip_obj = ipaddress.ip_address(ip)
 
-        # Check if IP is in AWS ranges
         for net in aws_networks:
             if ip_obj in net:
-                result["aws_signal"] = True
-                result["reason"] = f"AWS IP ({ip})"
+                sig_ip = True
+                score += 70
                 break
 
-        # Request HTML
-        r = requests.get(f"http://{domain}", timeout=6)
-        html = r.text.lower()
+        r = fetch_with_retry(f"https://{domain}") or fetch_with_retry(f"http://{domain}")
 
-        # Check HTML hints
-        if any(hint in html for hint in AWS_HINTS_HTML):
-            result["aws_signal"] = True
-            result["reason"] += " | HTML hints"
+        if r:
+            headers = str(r.headers).lower()
+            html = r.text.lower()
+            blob = headers + " " + html
 
-        # Check headers
-        headers_lower = {k.lower(): v.lower() for k, v in r.headers.items()}
-        if any(hint in str(headers_lower) for hint in AWS_HINTS_HEADERS):
-            result["aws_signal"] = True
-            result["reason"] += " | Headers hints"
+            if any(h in headers for h in AWS_HEADERS):
+                sig_header = True
+                score += 20
+
+            if any(h in html for h in AWS_HTML):
+                sig_html = True
+                score += 15
+
+            # service detection
+            for svc, patterns in SERVICE_PATTERNS.items():
+                if any(p in blob for p in patterns):
+                    service_flags[svc] = True
+                    score += 5
 
     except Exception as e:
-        result["reason"] += f" | Error: {str(e)}"
+        return {
+            "domain": domain,
+            "ip": ip_found,
+            "confidence": 0,
+            "classification": "Error",
+            "aws_ip_signal": False,
+            "header_signal": False,
+            "html_signal": False,
+            "aws_service_cloudfront": False,
+            "aws_service_s3": False,
+            "aws_service_elb": False,
+            "aws_service_apigw": False,
+            "service_hits": "",
+            "error": str(e)
+        }
 
-    return result
+    score = min(score, 100)
 
-# Upload CSV
+    services = [k for k, v in service_flags.items() if v]
+
+    return {
+        "domain": domain,
+        "ip": ip_found,
+        "confidence": score,
+        "classification": aws_label(score),
+        "aws_ip_signal": sig_ip,
+        "header_signal": sig_header,
+        "html_signal": sig_html,
+        "aws_service_cloudfront": service_flags["cloudfront"],
+        "aws_service_s3": service_flags["s3"],
+        "aws_service_elb": service_flags["elb"],
+        "aws_service_apigw": service_flags["apigw"],
+        "service_hits": ",".join(services),
+        "error": ""
+    }
+
+
+# ---------- UI ----------
+
 file = st.file_uploader("Upload domain CSV", type=["csv"])
+
 if file:
     df = pd.read_csv(file, header=None, names=["domain"])
-    results = []
+    domains = df["domain"].dropna().tolist()
 
-    for d in df["domain"]:
-        results.append(check_domain(d))
+    results = []
+    bar = st.progress(0)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futures = [ex.submit(check_domain, d) for d in domains]
+
+        for i, f in enumerate(concurrent.futures.as_completed(futures), 1):
+            results.append(f.result())
+            bar.progress(i / len(domains))
 
     out = pd.DataFrame(results)
+
+    st.success(f"Checked {len(out)} domains")
     st.dataframe(out)
 
     st.download_button(
-        "Download Results",
+        "Download AWS Results CSV",
         out.to_csv(index=False),
         "aws_results.csv"
     )
+

@@ -1,6 +1,7 @@
-streamlit
-pandas
-aiohttp
-requests
-dnspython
+streamlit>=1.30.0
+aiohttp>=3.9.0
+pandas>=2.0.0
+requests>=2.31.0
+dnspython>=2.4.0
+certifi>=2023.7.22
 

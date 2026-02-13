@@ -1,0 +1,17 @@
+# Cache files
+domain_cache.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.Python
+venv/
+env/
+
+# Mac
+.DS_Store
+
+# Streamlit
+.streamlit/
+

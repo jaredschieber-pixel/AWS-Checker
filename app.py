@@ -170,14 +170,21 @@ def load_aws_ips():
 @st.cache_data(ttl=7200, show_spinner=False)
 def load_azure_ips():
     """Load Azure IP ranges - cached for 2 hours"""
-    # Azure publishes IP ranges - we'll try the discovery endpoint first
     try:
-        # Try to get the current download URL from Azure's discovery page
+        # Get the current download URL from Microsoft's download page
+        # The URL changes weekly, so we need to scrape it
         discovery_url = "https://www.microsoft.com/en-us/download/confirmation.aspx?id=56519"
+        response = requests.get(discovery_url, timeout=10)
         
-        # Fallback to a known working direct link
-        # This URL is more stable - it's the "Public Cloud" service tags
-        url = "https://download.microsoft.com/download/7/1/D/71D86715-5596-4529-9B13-DA13A5DE5B63/ServiceTags_Public.json"
+        # Extract the actual download URL from the page
+        import re
+        match = re.search(r'https://download\.microsoft\.com/download/[^"]+/ServiceTags_Public_\d+\.json', response.text)
+        
+        if match:
+            url = match.group(0)
+        else:
+            # Fallback: try a recent known pattern
+            url = "https://download.microsoft.com/download/7/1/D/71D86715-5596-4529-9B13-DA13A5DE5B63/ServiceTags_Public_20250310.json"
         
         r = requests.get(url, timeout=15)
         r.raise_for_status()
